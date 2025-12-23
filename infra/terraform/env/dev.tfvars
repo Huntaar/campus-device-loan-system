@@ -9,7 +9,6 @@ do_project_name   = "campus-device-loan-project"
 
 db_cluster_name = "campus-device-loan-db"
 
-github_repo   = "vicmee76/campus-device-loan-system"
 github_branch = "main"
 
 deploy_on_push = false
