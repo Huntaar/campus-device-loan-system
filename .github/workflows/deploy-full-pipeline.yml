@@ -1,0 +1,744 @@
+name: Full Deployment Pipeline
+
+"on":
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+env:
+  DEVICE_APP_NAME: device-service
+  LOAN_APP_NAME: loan-service
+  FRONTEND_APP_NAME: campus-frontend
+  DB_CLUSTER_NAME: campus-device-loan-db
+  # Terraform Cloud (remote state)
+  TFC_ORGANIZATION: ${{ vars.TFC_ORGANIZATION }}
+  TFC_WORKSPACE: ${{ vars.TFC_WORKSPACE }}
+
+jobs:
+# =========================================================
+# Infrastructure managed by DigitalOcean App Platform
+# Auto-deploys on push to main
+# =========================================================
+
+# =========================================================
+# 0️⃣ TERRAFORM – Provision DigitalOcean App Platform Apps
+# =========================================================
+  terraform:
+    name: Terraform (Provision Apps)
+    runs-on: ubuntu-latest
+    env:
+      # Terraform Cloud auth for ALL terraform commands in this job (init/plan/apply/output/state)
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+    outputs:
+      database_url: ${{ steps.tf_outputs.outputs.database_url }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Configure Terraform remote state (Terraform Cloud)
+        working-directory: infra/terraform
+        env:
+          TFC_ORGANIZATION: ${{ env.TFC_ORGANIZATION }}
+          TFC_WORKSPACE: ${{ env.TFC_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          : "${TFC_ORGANIZATION:?Missing GitHub Actions variable TFC_ORGANIZATION}"
+          : "${TFC_WORKSPACE:?Missing GitHub Actions variable TFC_WORKSPACE}"
+
+          cat > backend.hcl <<EOF
+          organization = "${TFC_ORGANIZATION}"
+          workspaces {
+            name = "${TFC_WORKSPACE}"
+          }
+          EOF
+
+      - name: Terraform init
+        working-directory: infra/terraform
+        env:
+          TF_VAR_do_token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Import existing DO resources (avoid name already exists)
+        id: bootstrap_import
+        working-directory: infra/terraform
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+          TF_VAR_do_token: ${{ secrets.DIGITALOCEAN_TOKEN }}
+          TF_VAR_jwt_secret: ${{ secrets.JWT_SECRET }}
+          TF_VAR_jwt_expires_in: ${{ secrets.JWT_EXPIRES_IN }}
+        run: |
+          set -euo pipefail
+
+          # If remote state already has resources, skip bootstrap imports.
+          if terraform state list >/dev/null 2>&1 && [ "$(terraform state list | wc -l | tr -d ' ')" -gt 0 ]; then
+            echo "Terraform state already populated → skipping import bootstrap"
+            echo "import_ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # State is empty → we will attempt imports (best-effort).
+          echo "import_ran=true" >> "$GITHUB_OUTPUT"
+
+          # Import Apps by name (if they already exist in your DO account).
+          # NOTE: The list endpoint can be paginated AND often does not include spec.name,
+          # so we paginate through all apps, then resolve each name via GET /v2/apps/{id}.
+
+          list_all_app_ids () {
+            local url="https://api.digitalocean.com/v2/apps?per_page=200&page=1"
+            while [ -n "$url" ]; do
+              local resp next
+              resp="$(curl -fsS -H "Authorization: Bearer ${DIGITALOCEAN_TOKEN}" "$url")"
+
+              # Emit ids found on this page
+              echo "$resp" | jq -r '(.apps // [])[]? | .id'
+
+              # Follow pagination if present
+              next="$(echo "$resp" | jq -r '.links.pages.next // empty')"
+              url="$next"
+            done
+          }
+
+          find_app_id () {
+            local app_name="$1"
+            local id app_json name
+
+            while IFS= read -r id; do
+              [ -z "$id" ] && continue
+              app_json="$(curl -fsS -H "Authorization: Bearer ${DIGITALOCEAN_TOKEN}" "https://api.digitalocean.com/v2/apps/${id}")"
+              name="$(echo "$app_json" | jq -r '.app.spec.name // .app.name // empty')"
+              # Match exact OR prefix (some accounts/UI flows end up with generated suffixes)
+              if [ "$name" = "$app_name" ] || [[ "$name" == "${app_name}"* ]]; then
+                echo "$id"
+                return 0
+              fi
+            done < <(list_all_app_ids)
+
+            return 1
+          }
+
+          import_app () {
+            local tf_addr="$1"
+            local app_name="$2"
+            local app_id
+            app_id="$(find_app_id "$app_name" || true)"
+            if [ -n "$app_id" ] && [ "$app_id" != "null" ]; then
+              if ! terraform state show -no-color "$tf_addr" >/dev/null 2>&1; then
+                terraform import "$tf_addr" "$app_id"
+              fi
+            else
+              echo "WARN: No existing app found for name='${app_name}'."
+              echo "INFO: First few discovered apps (id + name) for debugging:"
+              list_all_app_ids | head -n 10 | while IFS= read -r dbg_id; do
+                dbg_json="$(curl -fsS -H "Authorization: Bearer ${DIGITALOCEAN_TOKEN}" "https://api.digitalocean.com/v2/apps/${dbg_id}")"
+                dbg_name="$(echo "$dbg_json" | jq -r '.app.spec.name // .app.name // empty')"
+                echo "- id=${dbg_id} name=${dbg_name}"
+              done
+            fi
+          }
+
+          import_app "digitalocean_app.device"   "${DEVICE_APP_NAME}"
+          import_app "digitalocean_app.loan"     "${LOAN_APP_NAME}"
+          import_app "digitalocean_app.frontend" "${FRONTEND_APP_NAME}"
+          
+          # NOTE:
+          # This import step is "best effort".
+          # - If resources exist, it imports them to avoid 409 name conflicts.
+          # - If you deleted everything to test a fresh create, it simply continues and Terraform will create them.
+
+          # Import DB cluster by name (if it already exists)
+          DBS_JSON="$(curl -fsS -H "Authorization: Bearer ${DIGITALOCEAN_TOKEN}" https://api.digitalocean.com/v2/databases?per_page=200)"
+          DB_ID="$(echo "$DBS_JSON" | jq -r --arg n "${DB_CLUSTER_NAME}" '(.databases // [])[] | select(.name == $n) | .id' | head -n 1)"
+          if [ -n "$DB_ID" ] && [ "$DB_ID" != "null" ]; then
+            if ! terraform state list | grep -q "^digitalocean_database_cluster.postgres$"; then
+              terraform import digitalocean_database_cluster.postgres "$DB_ID"
+            fi
+          fi
+
+      - name: Terraform validate
+        working-directory: infra/terraform
+        run: terraform validate
+
+      - name: Prepare dev auto tfvars (required for Terraform Cloud remote runs)
+        working-directory: infra/terraform
+        run: |
+          set -euo pipefail
+          cp env/dev.tfvars dev.auto.tfvars
+
+      - name: Sync Terraform Cloud workspace variables (from GitHub secrets)
+        working-directory: infra/terraform
+        env:
+          TFC_ORGANIZATION: ${{ env.TFC_ORGANIZATION }}
+          TFC_WORKSPACE: ${{ env.TFC_WORKSPACE }}
+          TFC_TOKEN: ${{ env.TF_TOKEN_app_terraform_io }}
+          DO_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          JWT_EXPIRES_IN: ${{ secrets.JWT_EXPIRES_IN }}
+        run: |
+          set -euo pipefail
+
+          : "${TFC_ORGANIZATION:?Missing TFC_ORGANIZATION}"
+          : "${TFC_WORKSPACE:?Missing TFC_WORKSPACE}"
+          : "${TFC_TOKEN:?Missing TF_TOKEN_app_terraform_io / TF_TOKEN_APP_TERRAFORM_IO secret}"
+
+          echo "::add-mask::$DO_TOKEN"
+          echo "::add-mask::$JWT_SECRET"
+
+          API="https://app.terraform.io/api/v2"
+
+          WS_ID="$(curl -fsS \
+            -H "Authorization: Bearer ${TFC_TOKEN}" \
+            -H "Content-Type: application/vnd.api+json" \
+            "${API}/organizations/${TFC_ORGANIZATION}/workspaces/${TFC_WORKSPACE}" \
+            | jq -r '.data.id')"
+
+          if [ -z "${WS_ID}" ] || [ "${WS_ID}" = "null" ]; then
+            echo "ERROR: Could not resolve Terraform Cloud workspace id for ${TFC_ORGANIZATION}/${TFC_WORKSPACE}"
+            exit 1
+          fi
+
+          upsert_var () {
+            local key="$1"
+            local value="$2"
+            local sensitive="$3" # true/false
+            local category="$4"  # terraform/env
+
+            local vars_json var_id payload
+            vars_json="$(curl -fsS \
+              -H "Authorization: Bearer ${TFC_TOKEN}" \
+              -H "Content-Type: application/vnd.api+json" \
+              "${API}/workspaces/${WS_ID}/vars")"
+
+            var_id="$(echo "$vars_json" | jq -r --arg k "$key" --arg c "$category" '(.data // [])[] | select(.attributes.key == $k and .attributes.category == $c) | .id' | head -n 1)"
+
+            payload="$(jq -n \
+              --arg key "$key" \
+              --arg value "$value" \
+              --arg category "$category" \
+              --argjson sensitive "$( [ "$sensitive" = "true" ] && echo true || echo false )" \
+              '{
+                data: {
+                  type: "vars",
+                  attributes: {
+                    key: $key,
+                    value: $value,
+                    category: $category,
+                    hcl: false,
+                    sensitive: $sensitive
+                  }
+                }
+              }')"
+
+            if [ -n "$var_id" ] && [ "$var_id" != "null" ]; then
+              curl -fsS -X PATCH \
+                -H "Authorization: Bearer ${TFC_TOKEN}" \
+                -H "Content-Type: application/vnd.api+json" \
+                -d "$payload" \
+                "${API}/vars/${var_id}" >/dev/null
+              echo "Updated Terraform Cloud var: ${category}.${key}"
+            else
+              curl -fsS -X POST \
+                -H "Authorization: Bearer ${TFC_TOKEN}" \
+                -H "Content-Type: application/vnd.api+json" \
+                -d "$payload" \
+                "${API}/workspaces/${WS_ID}/vars" >/dev/null
+              echo "Created Terraform Cloud var: ${category}.${key}"
+            fi
+          }
+
+          # These are Terraform input variables used by this configuration.
+          upsert_var "do_token"        "$DO_TOKEN"       "true"  "terraform"
+          upsert_var "jwt_secret"      "$JWT_SECRET"     "true"  "terraform"
+          upsert_var "jwt_expires_in"  "$JWT_EXPIRES_IN" "false" "terraform"
+
+      - name: Terraform plan (detect changes)
+        id: tf_plan
+        working-directory: infra/terraform
+        run: |
+          set -euo pipefail
+
+          # Exit codes:
+          # - 0 = no changes
+          # - 2 = changes present
+          # - 1 = error
+          set +e
+          terraform plan -detailed-exitcode
+          ec="$?"
+          set -e
+
+          if [ "$ec" -eq 1 ]; then
+            echo "Terraform plan failed"
+            exit 1
+          fi
+
+          if [ "$ec" -eq 2 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Terraform apply (create/update)
+        if: steps.tf_plan.outputs.has_changes == 'true'
+        working-directory: infra/terraform
+        run: terraform apply -auto-approve
+
+      # Important: On a brand-new workspace we may only import (no config drift), so plan=0 and apply would be skipped.
+      # However, Terraform outputs aren't written into state until an apply runs that evaluates them.
+      # We need a FULL apply (not refresh-only) to properly initialize outputs after import.
+      - name: Terraform apply (finalize imported state + outputs)
+        if: steps.tf_plan.outputs.has_changes == 'false' && steps.bootstrap_import.outputs.import_ran == 'true'
+        working-directory: infra/terraform
+        run: terraform apply -auto-approve
+
+      - name: Export Terraform outputs (for downstream jobs)
+        id: tf_outputs
+        working-directory: infra/terraform
+        run: |
+          set -euo pipefail
+
+          # On a new Terraform Cloud workspace, imports can succeed while `apply` is skipped (plan shows no changes).
+          # In that case, outputs may not be written into state yet. If the output isn't a valid DB URL, run a
+          # refresh-only apply to populate outputs, then try again.
+          set +e
+          DB_URL="$(terraform output -raw database_url 2>/dev/null)"
+          ec="$?"
+          set -e
+
+          needs_refresh="false"
+          if [ "$ec" -ne 0 ] || [ -z "${DB_URL}" ] || [ "${DB_URL}" = "null" ]; then
+            needs_refresh="true"
+          fi
+
+          # Guard against capturing warnings/errors as the "URL"
+          case "$DB_URL" in
+            *$'\n'*|*$'\r'*)
+              needs_refresh="true"
+              ;;
+            postgres://*|postgresql://*)
+              ;;
+            *)
+              needs_refresh="true"
+              ;;
+          esac
+
+          if [ "$needs_refresh" = "true" ]; then
+            echo "database_url output not available/valid yet. Running refresh-only apply to populate outputs..."
+            terraform apply -refresh-only -auto-approve
+            DB_URL="$(terraform output -raw database_url 2>/dev/null || true)"
+          fi
+
+          # Final validation before exporting to GitHub outputs.
+          if [ -z "${DB_URL}" ] || [ "${DB_URL}" = "null" ]; then
+            echo "ERROR: terraform output database_url is empty after refresh. This usually means the DB cluster wasn't created/imported correctly, or outputs were not updated in state."
+            terraform output || true
+            terraform state list || true
+            exit 1
+          fi
+
+          case "$DB_URL" in
+            *$'\n'*|*$'\r'*)
+              echo "ERROR: terraform output database_url contains newlines. Refusing to export it."
+              terraform output || true
+              exit 1
+              ;;
+            postgres://*|postgresql://*)
+              ;;
+            *)
+              echo "ERROR: terraform output database_url does not look like a Postgres URL. Refusing to export it."
+              terraform output || true
+              exit 1
+              ;;
+          esac
+
+          echo "::add-mask::$DB_URL"
+          {
+            echo "database_url<<EOF"
+            echo "$DB_URL"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+# =========================================================
+# 1️⃣ DATABASE – Migrations & Deterministic Seeding
+# =========================================================
+  database:
+    name: Database Setup
+    runs-on: ubuntu-latest
+    needs: terraform
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform (for reading remote state)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Read DATABASE_URL from Terraform Cloud state
+        working-directory: infra/terraform
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+          TFC_ORGANIZATION: ${{ vars.TFC_ORGANIZATION }}
+          TFC_WORKSPACE: ${{ vars.TFC_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          : "${TFC_ORGANIZATION:?Missing GitHub Actions variable TFC_ORGANIZATION}"
+          : "${TFC_WORKSPACE:?Missing GitHub Actions variable TFC_WORKSPACE}"
+
+          cat > backend.hcl <<EOF
+          organization = "${TFC_ORGANIZATION}"
+          workspaces {
+            name = "${TFC_WORKSPACE}"
+          }
+          EOF
+
+          terraform init -backend-config=backend.hcl
+
+          set +e
+          DB_URL="$(terraform output -raw database_url)"
+          ec="$?"
+          set -e
+
+          if [ "$ec" -ne 0 ] || [ -z "${DB_URL}" ] || [ "${DB_URL}" = "null" ]; then
+            echo "ERROR: terraform output database_url is empty"
+            terraform output || true
+            exit 1
+          fi
+
+          case "$DB_URL" in
+            *$'\n'*|*$'\r'*)
+              echo "ERROR: DATABASE_URL contains newlines. Refusing to write to GITHUB_ENV."
+              terraform output || true
+              exit 1
+              ;;
+            postgres://*|postgresql://*)
+              ;;
+            *)
+              echo "ERROR: DATABASE_URL does not look like a Postgres URL. Refusing to write to GITHUB_ENV."
+              terraform output || true
+              exit 1
+              ;;
+          esac
+
+          echo "::add-mask::$DB_URL"
+          echo "DATABASE_URL=$DB_URL" >> "$GITHUB_ENV"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install database dependencies
+        working-directory: database
+        run: npm install
+
+      # ---- Run migrations (TLS-safe for Aiven) ----
+      - name: Run migrations
+        working-directory: database
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: npm run migrate:latest
+
+      # ---- Seed database IF EMPTY (single source of truth) ----
+      - name: Seed database if empty
+        working-directory: database
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: |
+          cat > seed-if-empty.js << 'SCRIPT_EOF'
+          require('ts-node/register');
+          const config = require('./knexfile.ts').default;
+          const knex = require('knex');
+          const { execSync } = require('child_process');
+
+          const db = knex(config.production || config.development);
+
+          async function run() {
+            const result = await db('devices').count('* as count').first();
+            const count = Number(result.count || 0);
+
+            if (count === 0) {
+              console.log('Database empty → running seeds');
+              execSync('npm run seed', { stdio: 'inherit' });
+            } else {
+              console.log('Database already seeded → skipping');
+            }
+
+            await db.destroy();
+          }
+
+          run().catch(async (e) => {
+            console.error(e);
+            await db.destroy();
+            process.exit(1);
+          });
+          SCRIPT_EOF
+
+          node seed-if-empty.js
+
+
+# =========================================================
+# 2️⃣ DEVICE SERVICE
+# =========================================================
+  device-service:
+    name: Device Service
+    runs-on: ubuntu-latest
+    needs: database
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform (for reading remote state)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Read DATABASE_URL from Terraform Cloud state
+        working-directory: infra/terraform
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+          TFC_ORGANIZATION: ${{ vars.TFC_ORGANIZATION }}
+          TFC_WORKSPACE: ${{ vars.TFC_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          : "${TFC_ORGANIZATION:?Missing GitHub Actions variable TFC_ORGANIZATION}"
+          : "${TFC_WORKSPACE:?Missing GitHub Actions variable TFC_WORKSPACE}"
+
+          cat > backend.hcl <<EOF
+          organization = "${TFC_ORGANIZATION}"
+          workspaces {
+            name = "${TFC_WORKSPACE}"
+          }
+          EOF
+
+          terraform init -backend-config=backend.hcl
+
+          set +e
+          DB_URL="$(terraform output -raw database_url)"
+          ec="$?"
+          set -e
+
+          if [ "$ec" -ne 0 ] || [ -z "${DB_URL}" ] || [ "${DB_URL}" = "null" ]; then
+            echo "ERROR: terraform output database_url is empty"
+            terraform output || true
+            exit 1
+          fi
+
+          case "$DB_URL" in
+            *$'\n'*|*$'\r'*)
+              echo "ERROR: DATABASE_URL contains newlines. Refusing to write to GITHUB_ENV."
+              terraform output || true
+              exit 1
+              ;;
+            postgres://*|postgresql://*)
+              ;;
+            *)
+              echo "ERROR: DATABASE_URL does not look like a Postgres URL. Refusing to write to GITHUB_ENV."
+              terraform output || true
+              exit 1
+              ;;
+          esac
+
+          echo "::add-mask::$DB_URL"
+          echo "DATABASE_URL=$DB_URL" >> "$GITHUB_ENV"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        working-directory: backend/device-service
+        run: npm install
+
+      - name: Run unit tests
+        working-directory: backend/device-service
+        run: npm run test:unit
+
+      - name: Run integration tests
+        working-directory: backend/device-service
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: npm run test:integration
+
+      - name: Build project
+        working-directory: backend/device-service
+        run: npm run build
+
+      - name: Trigger DigitalOcean deployment
+        run: |
+          APP_ID=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.DIGITALOCEAN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            https://api.digitalocean.com/v2/apps | jq -r '.apps[] | select(.spec.name == env.DEVICE_APP_NAME) | .id' | head -n 1)
+
+          if [ -z "$APP_ID" ] || [ "$APP_ID" = "null" ]; then
+            echo "Could not find app id for ${DEVICE_APP_NAME}"
+            exit 1
+          fi
+
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.DIGITALOCEAN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            https://api.digitalocean.com/v2/apps/$APP_ID/deployments
+
+
+# =========================================================
+# 3️⃣ LOAN SERVICE
+# =========================================================
+  loan-service:
+    name: Loan Service
+    runs-on: ubuntu-latest
+    needs: device-service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform (for reading remote state)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - name: Read DATABASE_URL from Terraform Cloud state
+        working-directory: infra/terraform
+        env:
+          TF_TOKEN_app_terraform_io: ${{ secrets.TF_TOKEN_APP_TERRAFORM_IO }}
+          TFC_ORGANIZATION: ${{ vars.TFC_ORGANIZATION }}
+          TFC_WORKSPACE: ${{ vars.TFC_WORKSPACE }}
+        run: |
+          set -euo pipefail
+          : "${TFC_ORGANIZATION:?Missing GitHub Actions variable TFC_ORGANIZATION}"
+          : "${TFC_WORKSPACE:?Missing GitHub Actions variable TFC_WORKSPACE}"
+
+          cat > backend.hcl <<EOF
+          organization = "${TFC_ORGANIZATION}"
+          workspaces {
+            name = "${TFC_WORKSPACE}"
+          }
+          EOF
+
+          terraform init -backend-config=backend.hcl
+
+          set +e
+          DB_URL="$(terraform output -raw database_url)"
+          ec="$?"
+          set -e
+
+          if [ "$ec" -ne 0 ] || [ -z "${DB_URL}" ] || [ "${DB_URL}" = "null" ]; then
+            echo "ERROR: terraform output database_url is empty"
+            terraform output || true
+            exit 1
+          fi
+
+          case "$DB_URL" in
+            *$'\n'*|*$'\r'*)
+              echo "ERROR: DATABASE_URL contains newlines. Refusing to write to GITHUB_ENV."
+              terraform output || true
+              exit 1
+              ;;
+            postgres://*|postgresql://*)
+              ;;
+            *)
+              echo "ERROR: DATABASE_URL does not look like a Postgres URL. Refusing to write to GITHUB_ENV."
+              terraform output || true
+              exit 1
+              ;;
+          esac
+
+          echo "::add-mask::$DB_URL"
+          echo "DATABASE_URL=$DB_URL" >> "$GITHUB_ENV"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        working-directory: backend/loan-service
+        run: npm install
+
+      - name: Run unit tests
+        working-directory: backend/loan-service
+        run: npm run test:unit
+
+      - name: Run integration tests
+        working-directory: backend/loan-service
+        env:
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+        run: npm run test:integration
+
+      - name: Build project
+        working-directory: backend/loan-service
+        run: npm run build
+
+      - name: Trigger DigitalOcean deployment
+        run: |
+          APP_ID=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.DIGITALOCEAN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            https://api.digitalocean.com/v2/apps | jq -r '.apps[] | select(.spec.name == env.LOAN_APP_NAME) | .id' | head -n 1)
+
+          if [ -z "$APP_ID" ] || [ "$APP_ID" = "null" ]; then
+            echo "Could not find app id for ${LOAN_APP_NAME}"
+            exit 1
+          fi
+
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.DIGITALOCEAN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            https://api.digitalocean.com/v2/apps/$APP_ID/deployments
+
+
+# =========================================================
+# 4️⃣ FRONTEND
+# =========================================================
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    needs: loan-service
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Run tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Build Next.js app
+        working-directory: frontend
+        run: npm run build
+
+      - name: Trigger DigitalOcean deployment
+        run: |
+          APP_ID=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.DIGITALOCEAN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            https://api.digitalocean.com/v2/apps | jq -r '.apps[] | select(.spec.name == env.FRONTEND_APP_NAME) | .id' | head -n 1)
+
+          if [ -z "$APP_ID" ] || [ "$APP_ID" = "null" ]; then
+            echo "Could not find app id for ${FRONTEND_APP_NAME}"
+            exit 1
+          fi
+
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.DIGITALOCEAN_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            https://api.digitalocean.com/v2/apps/$APP_ID/deployments
