@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { deviceService } from '@/lib/api/device-service';
 import { Reservation, Waitlist, ApiResponse, PaginatedResponse } from '@/lib/types';
@@ -75,13 +75,31 @@ export default function DashboardPage() {
   const handleRemoveWaitlist = async (deviceId: string) => {
     if (!confirm('Are you sure you want to remove this from your waitlist?')) return;
 
+    // Optimistically remove the item from the waitlist state
+    const previousWaitlist = [...waitlist];
+    setWaitlist(prevWaitlist => prevWaitlist.filter(item => item.deviceId !== deviceId));
+
     try {
       const response = await deviceService.removeFromWaitlist(deviceId);
       if (response.success) {
-        alert('Removed from waitlist successfully');
-        fetchData();
+        // Success - item already removed optimistically, just refetch waitlist to ensure consistency
+        try {
+          const waitlistResponse: ApiResponse<Waitlist[]> = await deviceService.getMyWaitlist();
+          if (waitlistResponse.success && waitlistResponse.data) {
+            setWaitlist(waitlistResponse.data);
+          }
+        } catch (fetchErr) {
+          console.error('Failed to refresh waitlist:', fetchErr);
+          // If refresh fails, keep the optimistic update
+        }
+      } else {
+        // If removal failed, restore the previous state
+        setWaitlist(previousWaitlist);
+        alert(response.message || 'Failed to remove from waitlist');
       }
     } catch (err: any) {
+      // On error, restore the previous state
+      setWaitlist(previousWaitlist);
       alert(err.response?.data?.message || 'Failed to remove from waitlist');
     }
   };

@@ -3,8 +3,9 @@
 A cloud-native microservices platform for managing device loans in a campus environment. This system enables students and staff to reserve, borrow, and return devices (laptops, tablets, etc.) with automated workflows, waitlist management, and comprehensive tracking.
 
 
-Student Name: Okeke Chiemelie Gerald
-Student ID: C2581202
+**Student Name:** Okeke Chiemelie Gerald
+
+**Student ID:** C2581202
 
 Description:
 This repository contains the source code, infrastructure configuration,
