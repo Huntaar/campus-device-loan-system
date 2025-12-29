@@ -1,6 +1,6 @@
 # Test Cases Documentation
 
-This document lists all test cases used for testing across the Campus Device Loan System project.
+This particular document lists all test cases used for testing across the Campus Device Loan System project.
 
 ## Table of Contents
 1. [Device Service (Backend)](#device-service-backend)

@@ -893,6 +893,12 @@ Get the current authenticated user's reservations.
 
 ### Waitlist Endpoints
 
+**Important Notes**:
+- Waitlist entries have an `isNotified` field that indicates whether the user has been notified about device availability
+- The `getMyWaitlist` endpoint only returns entries where `isNotified = false` (active waitlist entries)
+- The `remove` endpoint only removes entries where `isNotified = false`
+- Once a user is notified (`isNotified = true`), they've been given the opportunity to reserve the device, and the entry is no longer considered active
+
 #### POST `/v1/api/waitlist/:deviceId/join`
 Join the waitlist for a device.
 
@@ -911,11 +917,13 @@ Join the waitlist for a device.
     "waitlistId": "uuid",
     "userId": "uuid",
     "deviceId": "uuid",
-    "joinedAt": "2024-01-01T00:00:00.000Z",
+    "addedAt": "2024-01-01T00:00:00.000Z",
     "position": 3
   }
 }
 ```
+
+**Note**: The `position` field indicates the user's position in the waitlist queue (1-indexed). Position is calculated based on FIFO ordering of non-notified entries.
 
 **Error Responses**:
 - `400` - User ID or Device ID is required
@@ -933,6 +941,8 @@ Remove yourself from a device waitlist.
 **Path Parameters**:
 - `deviceId` - Device UUID
 
+**Note**: This endpoint only removes waitlist entries where `isNotified = false`. If a user has already been notified about device availability, they cannot remove themselves from the waitlist using this endpoint.
+
 **Success Response** (200):
 ```json
 {
@@ -946,7 +956,7 @@ Remove yourself from a device waitlist.
 **Error Responses**:
 - `400` - User ID or Device ID is required
 - `401` - Not authenticated
-- `404` - Not on this waitlist
+- `404` - Not on this waitlist (or entry has already been notified)
 - `500` - Server error
 
 ---
@@ -972,11 +982,19 @@ Get paginated list of all waitlist entries (with details).
         "waitlistId": "uuid",
         "userId": "uuid",
         "deviceId": "uuid",
-        "joinedAt": "2024-01-01T00:00:00.000Z",
+        "addedAt": "2024-01-01T00:00:00.000Z",
+        "isNotified": false,
+        "notifiedAt": null,
         "device": {
           "brand": "Apple",
           "model": "MacBook Pro",
           "category": "Laptop"
+        },
+        "user": {
+          "email": "user@example.com",
+          "firstName": "John",
+          "lastName": "Doe",
+          "role": "student"
         }
       }
     ],
@@ -1000,7 +1018,7 @@ Get paginated list of all waitlist entries (with details).
 ---
 
 #### GET `/v1/api/waitlist/get-by-user-id/:userId`
-Get all waitlist entries for a specific user.
+Get all waitlist entries for a specific user (includes both notified and non-notified entries).
 
 **Authentication**: Required (Staff only)
 
@@ -1018,11 +1036,19 @@ Get all waitlist entries for a specific user.
       "waitlistId": "uuid",
       "userId": "uuid",
       "deviceId": "uuid",
-      "joinedAt": "2024-01-01T00:00:00.000Z",
+      "addedAt": "2024-01-01T00:00:00.000Z",
+      "isNotified": false,
+      "notifiedAt": null,
       "device": {
         "brand": "Apple",
         "model": "MacBook Pro",
         "category": "Laptop"
+      },
+      "user": {
+        "email": "user@example.com",
+        "firstName": "John",
+        "lastName": "Doe",
+        "role": "student"
       }
     }
   ]
@@ -1038,7 +1064,7 @@ Get all waitlist entries for a specific user.
 ---
 
 #### GET `/v1/api/waitlist/get-by-device-id/:deviceId`
-Get all waitlist entries for a specific device (ordered by join time).
+Get all waitlist entries for a specific device (ordered by `addedAt` timestamp, ascending).
 
 **Authentication**: Required (Staff only)
 
@@ -1056,11 +1082,19 @@ Get all waitlist entries for a specific device (ordered by join time).
       "waitlistId": "uuid",
       "userId": "uuid",
       "deviceId": "uuid",
-      "joinedAt": "2024-01-01T00:00:00.000Z",
+      "addedAt": "2024-01-01T00:00:00.000Z",
+      "isNotified": false,
+      "notifiedAt": null,
       "device": {
         "brand": "Apple",
         "model": "MacBook Pro",
         "category": "Laptop"
+      },
+      "user": {
+        "email": "user@example.com",
+        "firstName": "John",
+        "lastName": "Doe",
+        "role": "student"
       }
     }
   ]
@@ -1076,9 +1110,11 @@ Get all waitlist entries for a specific device (ordered by join time).
 ---
 
 #### GET `/v1/api/waitlist/my-waitlist`
-Get the current authenticated user's waitlist entries.
+Get the current authenticated user's active waitlist entries.
 
 **Authentication**: Required
+
+**Note**: This endpoint only returns waitlist entries where `isNotified = false`. Once a user has been notified that a device is available, that entry is no longer returned by this endpoint.
 
 **Success Response** (200):
 ```json
@@ -1091,11 +1127,19 @@ Get the current authenticated user's waitlist entries.
       "waitlistId": "uuid",
       "userId": "uuid",
       "deviceId": "uuid",
-      "joinedAt": "2024-01-01T00:00:00.000Z",
+      "addedAt": "2024-01-01T00:00:00.000Z",
+      "isNotified": false,
+      "notifiedAt": null,
       "device": {
         "brand": "Apple",
         "model": "MacBook Pro",
         "category": "Laptop"
+      },
+      "user": {
+        "email": "user@example.com",
+        "firstName": "John",
+        "lastName": "Doe",
+        "role": "student"
       }
     }
   ]
@@ -1426,7 +1470,7 @@ All health endpoints (`/health`, `/ready`, `/metrics`) are publicly accessible a
 ### Concurrency Handling
 
 - **Reservations**: The system uses database-level locking to prevent race conditions when multiple users try to reserve the same device simultaneously.
-- **Waitlist**: FIFO (First In, First Out) ordering is maintained based on `joinedAt` timestamp.
+- **Waitlist**: FIFO (First In, First Out) ordering is maintained based on `addedAt` timestamp. Only entries where `isNotified = false` are considered active and included in position calculations.
 
 ### Error Handling
 
