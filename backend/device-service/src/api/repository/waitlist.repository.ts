@@ -125,6 +125,7 @@ export class WaitlistRepository {
       .join('users', 'waitlist.user_id', 'users.user_id')
       .join('devices', 'waitlist.device_id', 'devices.device_id')
       .where('waitlist.user_id', userId)
+      .where('waitlist.is_notified', false)
       .where('users.is_deleted', false)
       .where('devices.is_deleted', false)
       .select(
