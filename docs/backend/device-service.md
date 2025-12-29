@@ -94,7 +94,7 @@ backend/device-service/
 
 ## API Endpoints
 
-See [API Reference](../API_REFERENCE.md) for complete endpoint documentation.
+See [API Reference](./API.md) for complete endpoint documentation.
 
 ### Health & Monitoring
 
@@ -109,11 +109,17 @@ See [API Reference](../API_REFERENCE.md) for complete endpoint documentation.
 - `GET /v1/api/users/get-all-users` - List all users (staff only)
 - `GET /v1/api/users/get-user-by-id/:id` - Get user by ID (staff only)
 
+### Email Notifications
+
+- `GET /v1/api/users/emails/user/:userId` - Get email notifications for a user (authenticated)
+- `GET /v1/api/users/emails/:id` - Get email notification by ID (authenticated)
+- `PATCH /v1/api/users/emails/:id/mark-read` - Mark email notification as read (authenticated)
+
 ### Device Management
 
 - `GET /v1/api/devices/get-all-devices` - List all devices (public)
 - `GET /v1/api/devices/get-device-by-id/:id` - Get device by ID (public)
-- `GET /v1/api/devices/available-devices` - List available devices with inventory counts (authenticated, student role)
+- `GET /v1/api/devices/available-devices` - List available devices with inventory counts (authenticated)
 
 ### Device Inventory
 
@@ -123,7 +129,7 @@ See [API Reference](../API_REFERENCE.md) for complete endpoint documentation.
 
 ### Reservations
 
-- `POST /v1/api/reservations/:deviceId/reserve` - Reserve a device (authenticated, student role)
+- `POST /v1/api/reservations/:deviceId/reserve` - Reserve a device (authenticated)
 - `PATCH /v1/api/reservations/:reservationId/cancel` - Cancel a reservation (authenticated, owner only)
 - `GET /v1/api/reservations/get-all` - List all reservations (staff only)
 - `GET /v1/api/reservations/get-by-user-id/:userId` - Get reservations by user ID (staff only)
@@ -132,12 +138,14 @@ See [API Reference](../API_REFERENCE.md) for complete endpoint documentation.
 
 ### Waitlist
 
-- `POST /v1/api/waitlist/:deviceId/join` - Join waitlist for a device (authenticated, student role)
+- `POST /v1/api/waitlist/:deviceId/join` - Join waitlist for a device (authenticated)
 - `DELETE /v1/api/waitlist/:deviceId/remove` - Remove from waitlist (authenticated, owner only)
+  - **Note**: Only removes entries where `isNotified = false` (active waitlist entries)
 - `GET /v1/api/waitlist/get-all` - List all waitlist entries (staff only)
 - `GET /v1/api/waitlist/get-by-user-id/:userId` - Get waitlist by user ID (staff only)
 - `GET /v1/api/waitlist/get-by-device-id/:deviceId` - Get waitlist by device ID (staff only)
 - `GET /v1/api/waitlist/my-waitlist` - Get current user's waitlist (authenticated)
+  - **Note**: Only returns entries where `isNotified = false` (active waitlist entries). Once a user is notified about device availability, that entry is no longer returned.
 
 ## Testing
 
@@ -170,7 +178,7 @@ npm run test:coverage
 
 ## Related Documentation
 
-- [API Reference](../API_REFERENCE.md) - Complete API documentation
+- [API Reference](./API.md) - Complete API documentation
 - [Main Project README](../../README.md) - Project overview
 - [Database Guide](../database/database.md) - Database migrations and seeds
 

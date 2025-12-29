@@ -116,9 +116,31 @@ This service connects to the shared PostgreSQL database using `DATABASE_URL` env
 
 Default port: **7779** (Device Service uses 7778)
 
+## Project Structure
+
+```
+backend/loan-service/
+├── src/
+│   ├── api/
+│   │   ├── controller/     # Request handlers
+│   │   ├── dtos/           # Data Transfer Objects
+│   │   ├── model/          # Data models
+│   │   ├── repository/     # Data access layer
+│   │   ├── routes/         # API routes
+│   │   ├── services/       # Business logic
+│   │   └── utils/          # Utility functions
+│   ├── database/
+│   │   ├── connection.ts   # Database connection (uses local knexfile)
+│   │   └── knexfile.ts     # Knex config (NO migrations)
+│   ├── index.ts            # Application entry point
+│   └── loan-app.ts         # Express app configuration
+├── package.json
+└── tsconfig.json
+```
+
 ## API Endpoints
 
-See [API Reference](../API_REFERENCE.md) for complete endpoint documentation.
+See [API Reference](./API.md) for complete endpoint documentation.
 
 ### Health & Monitoring
 
@@ -129,9 +151,13 @@ See [API Reference](../API_REFERENCE.md) for complete endpoint documentation.
 ### Loan Management
 
 - `PATCH /v1/api/loans/:reservationId/collect` - Mark reservation as collected and create loan (staff only)
+  - Creates a loan record and updates reservation status to "collected"
 - `PATCH /v1/api/loans/:loanId/return` - Mark loan as returned and update inventory (staff only)
+  - Updates loan status, makes inventory available, and notifies next waitlist user
 - `GET /v1/api/loans/get-all-loans` - Get all loans with pagination (staff only)
-- `GET /v1/api/loans/user/:userId` - Get loans for a specific user (staff only)
+  - Returns loans with full details (reservation, device, inventory, user)
+- `GET /v1/api/loans/user/:userId` - Get loans for a specific user with pagination (staff only)
+  - Returns loans for a specific user with full details
 
 ## Architecture
 
@@ -164,7 +190,7 @@ npm run test:coverage
 
 ## Related Documentation
 
-- [API Reference](../API_REFERENCE.md) - Complete API documentation
+- [API Reference](./API.md) - Complete API documentation
 - [Main Project README](../../README.md) - Project overview
 - [Database Guide](../database/database.md) - Database migrations and seeds
 
